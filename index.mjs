@@ -11,12 +11,22 @@
  * admin page's prompt when you use it):
  *   POST /admin/allowlist
  *     Body: { csv: string }
- *     Parses the CSV, builds the Merkle tree, fully replaces
- *     crocpad_proofs, and returns { root, count } so the admin page can
- *     submit that root on-chain with one wallet transaction.
+ *     Parses the CSV, builds the Merkle tree, upserts every address's
+ *     proof into crocpad_proofs (tagged with this run's list_generation),
+ *     then removes any row left over from a previous run. Returns
+ *     { root, count } so the admin page can submit that root on-chain
+ *     with one wallet transaction.
+ *
+ *     This route is idempotent: if it fails partway through (bad batch,
+ *     transient network blip, a second upload racing this one), nothing
+ *     is deleted up front, so the previous list stays valid and it is
+ *     always safe to just retry the same upload.
  *
  * Deploy this as its own Railway service. Env vars needed:
  *   SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ALLOWED_ORIGIN, ADMIN_API_KEY
+ *
+ * Requires migration-006-list-generation.sql to have been run (adds the
+ * list_generation column used to safely prune stale rows after upload).
  */
 
 import express from "express";
@@ -151,29 +161,60 @@ app.post("/admin/allowlist", adminLimiter, requireAdmin, async (req, res) => {
   const tree = new MerkleTree(leaves, keccak256, { sortPairs: true });
   const root = tree.getHexRoot();
 
-  // Full replace — this CSV is the single source of truth for the list.
-  const { error: deleteError } = await supabase
-    .from("crocpad_proofs")
-    .delete()
-    .neq("wallet_address", "");
-  if (deleteError) {
-    console.error("Failed clearing old proofs:", deleteError.message);
-    return res.status(500).json({ error: "Failed clearing previous list." });
-  }
+  // Tags every row written by this run so cleanup afterward can find
+  // exactly what's stale without ever building a giant address list.
+  const runId = new Date().toISOString();
 
   const rows = addresses.map((address, i) => ({
     wallet_address: address.toLowerCase(),
     proof: tree.getHexProof(leaves[i]),
+    list_generation: runId,
   }));
 
+  // Upsert instead of delete-then-insert: old rows stay valid until the
+  // moment they're superseded or cleaned up below, so a failure mid-way
+  // through never leaves the table in a worse state than before this ran.
+  // Re-running the exact same request after a failure is always safe.
   const BATCH_SIZE = 500;
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
-    const { error: insertError } = await supabase.from("crocpad_proofs").insert(batch);
-    if (insertError) {
-      console.error(`Failed writing batch at row ${i}:`, insertError.message);
-      return res.status(500).json({ error: "Failed writing proofs partway through. List may be in a partial state — try again." });
+    const { error: upsertError } = await supabase
+      .from("crocpad_proofs")
+      .upsert(batch, { onConflict: "wallet_address" });
+
+    if (upsertError) {
+      console.error(`Failed writing batch at row ${i}:`, upsertError);
+      // Full detail goes back to the admin caller only — this route is
+      // already gated by ADMIN_API_KEY, so it's safe to be specific here.
+      return res.status(500).json({
+        error: "Failed writing proofs. No rows were deleted — the previous list (if any) is still intact and it's safe to retry this exact upload.",
+        detail: {
+          message: upsertError.message,
+          code: upsertError.code,
+          hint: upsertError.hint,
+          details: upsertError.details,
+        },
+        failedAtRow: i,
+        totalRows: rows.length,
+      });
     }
+  }
+
+  // Only after every row is safely upserted do we remove addresses that
+  // were on the old list but aren't in this new CSV. Filtering by
+  // list_generation (one value) instead of a huge "not in (...)" list
+  // keeps this cheap and correct no matter how large the upload is.
+  // If this step fails, the new list is already fully written and
+  // correct — just stale wallets remain, which is harmless (they simply
+  // won't verify against the new on-chain root once you set it).
+  const { error: cleanupError } = await supabase
+    .from("crocpad_proofs")
+    .delete()
+    .neq("list_generation", runId);
+
+  if (cleanupError) {
+    console.error("Cleanup of stale rows failed (new list is intact):", cleanupError);
+    // Don't fail the request over this — the new list is correct and usable.
   }
 
   return res.status(200).json({

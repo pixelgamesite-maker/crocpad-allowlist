@@ -10,6 +10,8 @@
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.0",
     "@supabase/supabase-js": "^2.45.0",
-    "viem": "^2.21.0"
+    "viem": "^2.21.0",
+    "merkletreejs": "^0.4.0",
+    "keccak256": "^1.0.6"
   }
 }

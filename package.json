@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "node server/index.mjs"
+    "start": "node index.mjs"
   },
   "dependencies": {
     "express": "^4.19.2",

@@ -230,3 +230,4 @@ app.get("/health", (req, res) => res.status(200).send("ok"));
 app.listen(PORT, () => {
   console.log(`Allowlist API listening on port ${PORT}`);
 });
+

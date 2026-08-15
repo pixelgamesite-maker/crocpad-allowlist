@@ -52,6 +52,16 @@ if (!ADMIN_API_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const app = express();
+
+// Railway sits in front of this app as a reverse proxy. Without this,
+// Express sees every request as coming from Railway's proxy IP instead
+// of each visitor's real IP — which turns every rate limiter below into
+// a single shared bucket for your entire site's traffic, not a
+// per-visitor limit. This restores correct per-IP behavior. This exact
+// gap caused the "Too many requests" / "Eligibility check unavailable"
+// bug that showed up under real traffic — don't remove this line.
+app.set("trust proxy", 1);
+
 app.use(express.json({ limit: "5mb" })); // CSVs can be large with a few thousand rows
 
 app.use((req, res, next) => {
@@ -66,7 +76,7 @@ app.use((req, res, next) => {
 
 const lookupLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,
+  max: 60, // raised from 20 — real mint traffic needs headroom now that this is correctly per-visitor
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests. Try again shortly." },
@@ -230,4 +240,3 @@ app.get("/health", (req, res) => res.status(200).send("ok"));
 app.listen(PORT, () => {
   console.log(`Allowlist API listening on port ${PORT}`);
 });
-
